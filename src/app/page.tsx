@@ -23,6 +23,7 @@ interface AnalysisResult {
   majorFails: number;
   minorFails: number;
   checks: CheckResult[];
+  limitations: string[];
 }
 
 const ADSENSE_TIPS = [
@@ -472,6 +473,20 @@ export default function Home() {
                     </li>
                   </ol>
                 </div>
+
+                {/* Limitations */}
+                {result.limitations && result.limitations.length > 0 && (
+                  <div className="bg-gray-50 border border-gray-200 rounded-xl p-5">
+                    <h3 className="text-sm font-semibold text-gray-500 mb-2">
+                      분석 한계 안내
+                    </h3>
+                    <ul className="space-y-1 text-xs text-gray-500">
+                      {result.limitations.map((l, i) => (
+                        <li key={i}>- {l}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
             )}
           </>

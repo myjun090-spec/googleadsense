@@ -115,24 +115,34 @@ export async function POST(req: NextRequest) {
         : "50~160자 사이의 사이트 설명을 <meta name='description'> 태그에 추가하세요. 검색엔진이 이를 활용합니다.",
     });
 
-    // 4. 콘텐츠 양 체크
+    // 4. 콘텐츠 양 체크 (한국어는 글자 수 기준으로 측정)
     const bodyText = $("body").text().replace(/\s+/g, " ").trim();
+    // 한국어 글자 수 (공백 제외)
+    const koreanCharCount = bodyText.replace(/\s/g, "").length;
+    // 영어 단어 수
     const wordCount = bodyText.split(/\s+/).length;
-    const hasEnoughContent = wordCount >= 300;
+    // 한국어가 포함되어 있으면 글자 수 기준, 아니면 단어 수 기준
+    const hasKorean = /[가-힣]/.test(bodyText);
+    const contentMetric = hasKorean ? koreanCharCount : wordCount;
+    const contentThreshold = hasKorean ? 500 : 300;
+    const hasEnoughContent = contentMetric >= contentThreshold;
+    const contentUnit = hasKorean ? "글자" : "단어";
     checks.push({
       id: "content-amount",
       category: "콘텐츠",
       name: "충분한 콘텐츠 양",
       passed: hasEnoughContent,
       severity: "critical",
-      detail: `메인 페이지 텍스트 약 ${wordCount}단어 감지.`,
+      detail: `메인 페이지 텍스트 약 ${contentMetric.toLocaleString()}${contentUnit} 감지. (참고: 메인 페이지만 분석됨, 전체 사이트 콘텐츠와 다를 수 있음)`,
       solution: hasEnoughContent
         ? ""
         : "Google은 최소 20~30개의 고품질 글(각 800~1500자 이상)을 권장합니다. 독창적이고 유용한 콘텐츠를 꾸준히 작성하세요.",
     });
 
     // 5. 네비게이션 메뉴
-    const navLinks = $("nav a, header a, .nav a, .menu a, .navbar a").length;
+    const navLinks = $(
+      "nav a, header a, .nav a, .menu a, .navbar a, .navigation a, [role='navigation'] a, .gnb a, .lnb a, #header a, #nav a"
+    ).length;
     const hasNav = navLinks >= 3;
     checks.push({
       id: "navigation",
@@ -148,6 +158,36 @@ export async function POST(req: NextRequest) {
         : "사이트 상단에 명확한 네비게이션 메뉴를 추가하세요. 홈, 카테고리, 소개, 연락처 등의 메뉴가 필요합니다.",
     });
 
+    // 공통 페이지 URL 존재 확인 (병렬)
+    const baseUrl = new URL(finalUrl).origin;
+    const commonPages = [
+      { key: "privacy", paths: ["/privacy", "/privacy-policy", "/policy"] },
+      { key: "terms", paths: ["/terms", "/terms-of-service", "/tos"] },
+      { key: "about", paths: ["/about", "/about-us", "/intro"] },
+      { key: "contact", paths: ["/contact", "/contact-us"] },
+    ];
+    const pageExistence: Record<string, boolean> = {};
+    await Promise.all(
+      commonPages.map(async ({ key, paths }) => {
+        for (const p of paths) {
+          try {
+            const res = await fetch(baseUrl + p, {
+              method: "HEAD",
+              signal: AbortSignal.timeout(3000),
+              redirect: "follow",
+            });
+            if (res.ok) {
+              pageExistence[key] = true;
+              return;
+            }
+          } catch {
+            // ignore
+          }
+        }
+        pageExistence[key] = false;
+      })
+    );
+
     // 6. 개인정보 처리방침
     const allLinks = $("a")
       .map((_, el) => ({
@@ -155,13 +195,17 @@ export async function POST(req: NextRequest) {
         text: $(el).text().toLowerCase(),
       }))
       .get();
-    const hasPrivacy = allLinks.some(
+    const hasPrivacyLink = allLinks.some(
       (l) =>
         l.text.includes("privacy") ||
         l.text.includes("개인정보") ||
+        l.text.includes("정보처리") ||
+        l.text.includes("정보보호") ||
         l.href.includes("privacy") ||
+        l.href.includes("policy") ||
         l.text.includes("프라이버시")
     );
+    const hasPrivacy = hasPrivacyLink || pageExistence["privacy"];
     checks.push({
       id: "privacy-policy",
       category: "필수 페이지",
@@ -177,13 +221,18 @@ export async function POST(req: NextRequest) {
     });
 
     // 7. 이용약관 / 서비스 약관
-    const hasTerms = allLinks.some(
+    const hasTermsLink = allLinks.some(
       (l) =>
         l.text.includes("terms") ||
         l.text.includes("이용약관") ||
         l.text.includes("서비스 약관") ||
-        l.href.includes("terms")
+        l.text.includes("이용 약관") ||
+        l.text.includes("면책") ||
+        l.text.includes("disclaimer") ||
+        l.href.includes("terms") ||
+        l.href.includes("disclaimer")
     );
+    const hasTerms = hasTermsLink || pageExistence["terms"];
     checks.push({
       id: "terms",
       category: "필수 페이지",
@@ -199,13 +248,18 @@ export async function POST(req: NextRequest) {
     });
 
     // 8. 소개 페이지 (About)
-    const hasAbout = allLinks.some(
+    const hasAboutLink = allLinks.some(
       (l) =>
         l.text.includes("about") ||
         l.text.includes("소개") ||
+        l.text.includes("프로필") ||
+        l.text.includes("운영자") ||
+        l.text.includes("블로그 소개") ||
         l.href.includes("about") ||
+        l.href.includes("profile") ||
         l.text.includes("회사소개")
     );
+    const hasAbout = hasAboutLink || pageExistence["about"];
     checks.push({
       id: "about",
       category: "필수 페이지",
@@ -221,13 +275,18 @@ export async function POST(req: NextRequest) {
     });
 
     // 9. 연락처 페이지
-    const hasContact = allLinks.some(
+    const hasContactLink = allLinks.some(
       (l) =>
         l.text.includes("contact") ||
         l.text.includes("연락") ||
         l.text.includes("문의") ||
-        l.href.includes("contact")
+        l.text.includes("고객센터") ||
+        l.text.includes("1:1") ||
+        l.text.includes("이메일") ||
+        l.href.includes("contact") ||
+        l.href.includes("mailto:")
     );
+    const hasContact = hasContactLink || pageExistence["contact"];
     checks.push({
       id: "contact",
       category: "필수 페이지",
@@ -404,12 +463,28 @@ export async function POST(req: NextRequest) {
     });
 
     // 18. 도메인 나이 / 커스텀 도메인
-    const isCustomDomain =
-      !finalUrl.includes("blogspot") &&
-      !finalUrl.includes("wordpress.com") &&
-      !finalUrl.includes("wixsite") &&
-      !finalUrl.includes("tistory") &&
-      !finalUrl.includes("github.io");
+    const freeDomains = [
+      "blogspot",
+      "wordpress.com",
+      "wixsite",
+      "tistory.com",
+      "github.io",
+      "netlify.app",
+      "vercel.app",
+      "herokuapp.com",
+      "weebly.com",
+      "squarespace.com",
+      "tumblr.com",
+      "medium.com",
+      "notion.site",
+      "carrd.co",
+      "webflow.io",
+      "surge.sh",
+      "pages.dev",
+      "firebaseapp.com",
+      "web.app",
+    ];
+    const isCustomDomain = !freeDomains.some((d) => finalUrl.includes(d));
     checks.push({
       id: "custom-domain",
       category: "기본 요건",
@@ -502,6 +577,12 @@ export async function POST(req: NextRequest) {
       minorFails: minorFails.length,
       checks,
       contentType: responseHeaders.get("content-type") || "",
+      limitations: [
+        "메인 페이지(홈) HTML만 분석합니다. 하위 페이지의 콘텐츠는 포함되지 않습니다.",
+        "JavaScript로 동적 렌더링되는 콘텐츠(SPA)는 감지되지 않을 수 있습니다.",
+        "실제 AdSense 승인은 Google 심사팀의 종합적 판단에 따르며, 이 도구는 참고용입니다.",
+        "콘텐츠 독창성, 트래픽 양, 도메인 나이 등은 외부에서 정확히 측정할 수 없습니다.",
+      ],
     });
   } catch (error) {
     console.error("Analysis error:", error);
