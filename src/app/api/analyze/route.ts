@@ -142,8 +142,37 @@ async function getPageSpeedScore(url: string): Promise<{ performance: number; mo
   }
 }
 
-// Wayback Machine으로 도메인 나이 추정
+// Wayback Machine CDX API로 도메인 나이 추정 (최초 아카이브 날짜)
 async function getDomainAge(domain: string): Promise<{ firstSeen: string; ageMonths: number } | null> {
+  try {
+    // CDX API: 가장 오래된 스냅샷 1개만 가져오기
+    const cdxUrl = `https://web.archive.org/cdx/search/cdx?url=${domain}&output=json&limit=1&fl=timestamp&filter=statuscode:200`;
+    const res = await fetch(cdxUrl, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) {
+      // fallback: available API
+      return await getDomainAgeFallback(domain);
+    }
+    const data = await res.json();
+    // data[0]은 헤더, data[1]이 첫 번째 결과
+    if (!data || data.length < 2 || !data[1]?.[0]) {
+      return await getDomainAgeFallback(domain);
+    }
+
+    const ts = data[1][0];
+    const year = parseInt(ts.substring(0, 4));
+    const month = parseInt(ts.substring(4, 6));
+    const firstSeen = `${year}년 ${month}월`;
+
+    const now = new Date();
+    const ageMonths = (now.getFullYear() - year) * 12 + (now.getMonth() + 1 - month);
+
+    return { firstSeen, ageMonths };
+  } catch {
+    return await getDomainAgeFallback(domain);
+  }
+}
+
+async function getDomainAgeFallback(domain: string): Promise<{ firstSeen: string; ageMonths: number } | null> {
   try {
     const apiUrl = `https://archive.org/wayback/available?url=${domain}&timestamp=20000101`;
     const res = await fetch(apiUrl, { signal: AbortSignal.timeout(5000) });
@@ -155,7 +184,7 @@ async function getDomainAge(domain: string): Promise<{ firstSeen: string; ageMon
     const ts = snapshot.timestamp;
     const year = parseInt(ts.substring(0, 4));
     const month = parseInt(ts.substring(4, 6));
-    const firstSeen = `${year}년 ${month}월`;
+    const firstSeen = `${year}년 ${month}월 (추정)`;
 
     const now = new Date();
     const ageMonths = (now.getFullYear() - year) * 12 + (now.getMonth() + 1 - month);
@@ -267,7 +296,52 @@ export async function POST(req: NextRequest) {
     const { html, finalUrl, status: statusCode } = mainPage;
     const $ = cheerio.load(html);
     const baseUrl = new URL(finalUrl).origin;
+    const hostname = new URL(finalUrl).hostname;
     const checks: CheckResult[] = [];
+
+    // AdSense 연동 불가 플랫폼 감지
+    const unsupportedPlatforms: Record<string, string> = {
+      "naver.com": "네이버 블로그/카페는 Google AdSense를 연동할 수 없습니다. 자체 도메인으로 워드프레스 등을 사용하세요.",
+      "blog.naver.com": "네이버 블로그는 Google AdSense를 연동할 수 없습니다.",
+      "cafe.naver.com": "네이버 카페는 Google AdSense를 연동할 수 없습니다.",
+      "blog.daum.net": "다음 블로그는 Google AdSense를 연동할 수 없습니다.",
+      "velog.io": "velog는 Google AdSense를 연동할 수 없습니다. 자체 도메인 블로그를 만드세요.",
+      "medium.com": "Medium은 자체 수익 프로그램이 있으며, AdSense를 직접 연동할 수 없습니다.",
+      "brunch.co.kr": "브런치는 Google AdSense를 연동할 수 없습니다.",
+      "notion.site": "Notion 사이트는 Google AdSense를 연동할 수 없습니다.",
+    };
+
+    const unsupportedKey = Object.keys(unsupportedPlatforms).find((key) =>
+      hostname === key || hostname.endsWith("." + key)
+    );
+    if (unsupportedKey) {
+      return NextResponse.json({
+        url: finalUrl,
+        statusCode,
+        score: 0,
+        verdict: "AdSense 연동 불가 플랫폼",
+        verdictColor: "red",
+        totalChecks: 0,
+        passedChecks: 0,
+        criticalFails: 1,
+        majorFails: 0,
+        minorFails: 0,
+        checks: [{
+          id: "unsupported-platform",
+          category: "기본 요건",
+          name: "AdSense 연동 가능 플랫폼",
+          passed: false,
+          severity: "critical" as const,
+          detail: unsupportedPlatforms[unsupportedKey],
+          solution: "자체 도메인(yourdomain.com)을 구매하고, WordPress, Ghost, Next.js 등으로 블로그를 만들어 호스팅하세요. Vercel, Netlify 등에서 무료 호스팅이 가능합니다.",
+        }],
+        deepAnalysis: {
+          totalPages: 0, analyzedPages: 0, avgCharCount: 0, avgHeadings: 0,
+          avgImages: 0, pageDetails: [], domainAge: null, pageSpeed: null,
+          policyViolations: [], internalLinks: { count: 0, unique: 0 },
+        },
+      });
+    }
 
     // 2단계: 병렬로 외부 데이터 수집
     const [
@@ -393,7 +467,7 @@ export async function POST(req: NextRequest) {
       avgCharCount = Math.round(pageAnalyses.reduce((sum, p) => sum + p.charCount, 0) / pageAnalyses.length);
       goodContentPages = pageAnalyses.filter((p) => p.hasEnoughContent).length;
     }
-    const contentQualityOk = pageAnalyses.length === 0 || goodContentPages >= pageAnalyses.length * 0.7;
+    const contentQualityOk = pageAnalyses.length > 0 && goodContentPages >= pageAnalyses.length * 0.7;
     checks.push({
       id: "content-quality",
       category: "콘텐츠",
@@ -402,8 +476,8 @@ export async function POST(req: NextRequest) {
       severity: "critical",
       detail: pageAnalyses.length > 0
         ? `${pageAnalyses.length}개 글 분석 → 평균 ${avgCharCount.toLocaleString()}자, ${goodContentPages}/${pageAnalyses.length}개가 800자 이상.`
-        : "개별 글을 분석할 수 없었습니다 (사이트맵 없음).",
-      solution: "모든 글이 최소 800~1500자 이상이어야 합니다. 짧은 글은 보강하거나 합치세요.",
+        : "사이트맵이 없어 개별 글을 분석할 수 없었습니다. sitemap.xml을 추가하세요.",
+      solution: "모든 글이 최소 800~1500자 이상이어야 합니다. sitemap.xml도 반드시 추가하세요.",
     });
 
     // 6. 콘텐츠 구조 (제목, 이미지 활용)
@@ -413,7 +487,7 @@ export async function POST(req: NextRequest) {
       avgHeadings = Math.round(pageAnalyses.reduce((sum, p) => sum + p.headingCount, 0) / pageAnalyses.length);
       avgImages = Math.round(pageAnalyses.reduce((sum, p) => sum + p.imageCount, 0) / pageAnalyses.length);
     }
-    const structureOk = pageAnalyses.length === 0 || (avgHeadings >= 2 && avgImages >= 1);
+    const structureOk = pageAnalyses.length > 0 && avgHeadings >= 2 && avgImages >= 1;
     checks.push({
       id: "content-structure",
       category: "콘텐츠",
@@ -422,7 +496,7 @@ export async function POST(req: NextRequest) {
       severity: "major",
       detail: pageAnalyses.length > 0
         ? `평균 소제목 ${avgHeadings}개, 이미지 ${avgImages}개 / 글.`
-        : "개별 글 구조를 분석할 수 없었습니다.",
+        : "사이트맵이 없어 글 구조를 분석할 수 없었습니다.",
       solution: "각 글에 H2/H3 소제목 3~5개, 관련 이미지 2~3개를 넣어 가독성을 높이세요.",
     });
 
@@ -695,18 +769,18 @@ export async function POST(req: NextRequest) {
     // ── 성능 ──
 
     // 24. PageSpeed 성능
-    const perfOk = pageSpeedResult ? pageSpeedResult.performance >= 50 : true;
-    checks.push({
-      id: "pagespeed",
-      category: "성능",
-      name: "Google PageSpeed 점수",
-      passed: perfOk,
-      severity: "major",
-      detail: pageSpeedResult
-        ? pageSpeedResult.details.join(" | ")
-        : "PageSpeed API에 연결할 수 없었습니다.",
-      solution: "이미지 최적화, 코드 압축, 캐싱 설정으로 50점 이상을 목표로 하세요.",
-    });
+    if (pageSpeedResult) {
+      const perfOk = pageSpeedResult.performance >= 50;
+      checks.push({
+        id: "pagespeed",
+        category: "성능",
+        name: "Google PageSpeed 점수 (모바일)",
+        passed: perfOk,
+        severity: "major",
+        detail: pageSpeedResult.details.join(" | "),
+        solution: "이미지 최적화, 코드 압축, 캐싱 설정으로 모바일 50점 이상을 목표로 하세요.",
+      });
+    }
 
     // 25. 페이지 크기
     const htmlSize = html.length;
